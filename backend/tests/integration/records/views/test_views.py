@@ -130,6 +130,42 @@ def test_does_not_update_stale(inspire_app):
     assert stale_put_response.status_code == 412
 
 
+def test_patch_literature_external_system_identifiers(inspire_app):
+    cataloger = create_user(role="cataloger")
+    existing_identifier = {"schema": "CDS", "value": "existing"}
+    added_identifier = {"schema": "CDSRDM", "value": "1849g-prn51"}
+    record = create_record(
+        "lit", data={"external_system_identifiers": [existing_identifier]}
+    )
+    record_control_number = record["control_number"]
+    patch = [
+        {
+            "op": "add",
+            "path": "/external_system_identifiers",
+            "value": [existing_identifier, added_identifier],
+        }
+    ]
+
+    with inspire_app.test_client() as client:
+        login_user_via_session(client, email=cataloger.email)
+        response = client.patch(
+            f"/literature/{record_control_number}",
+            content_type="application/json-patch+json",
+            data=orjson.dumps(patch),
+            headers={"If-Match": '"0"'},
+        )
+
+    expected_identifiers = [existing_identifier, added_identifier]
+    assert response.status_code == 200
+    assert (
+        response.json["metadata"]["external_system_identifiers"] == expected_identifiers
+    )
+
+    db.session.remove()
+    updated_record = LiteratureRecord.get_record_by_pid_value(record_control_number)
+    assert updated_record["external_system_identifiers"] == expected_identifiers
+
+
 def test_returns_200_if_not_modified(inspire_app):
     record = create_record("lit")
     record_control_number = record["control_number"]
