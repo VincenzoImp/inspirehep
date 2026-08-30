@@ -6,12 +6,23 @@ from urllib.parse import urlparse
 
 import pytest
 from airflow.models import DagBag
-from include.utils.elsevier import process_article
+from include.utils.elsevier import process_article, process_package
 from include.utils.s3 import S3JsonStore
 
 from tests.test_utils import task_test
 
 dagbag = DagBag()
+
+
+def _read_article_without_doi(datadir):
+    zip_file = "117653164249626153-00001-FULL-XML-VACUUM (0042-207X) 1.7.14.ZIP"
+    file_name = "0042-207X/S0042207X26X20012/S0042207X26001600/" "S0042207X26001600.xml"
+    with zipfile.ZipFile(datadir / zip_file) as zip_package:
+        xml_text = zip_package.read(file_name).decode("utf-8", errors="ignore")
+    xml_text = xml_text.replace(
+        "<prism:doi>10.1016/j.vacuum.2026.115222</prism:doi>", ""
+    )
+    return file_name, xml_text
 
 
 @pytest.mark.usefixtures("hep_env")
@@ -62,6 +73,138 @@ class TestElsevierHarvest:
                 "data"
             ]["documents"][0]["url"]
         )
+
+    def test_process_package_without_doi_uploads_safe_filename_and_workflow(
+        self, datadir
+    ):
+        _, xml_text = _read_article_without_doi(datadir)
+        member_name = "issue/article#revision?.xml"
+        package = BytesIO()
+        with zipfile.ZipFile(package, "w") as zip_package:
+            zip_package.writestr(member_name, xml_text)
+
+        package_key = "packages/issue.zip"
+        s3_store = Mock()
+        s3_store.hook.get_key.return_value.get.return_value = {
+            "Body": BytesIO(package.getvalue())
+        }
+        s3_store.key_to_s3_url.side_effect = (
+            lambda key: f"https://s3.example/elsevier-store/{key}"
+        )
+        workflow_management_hook = Mock()
+
+        failed_records = process_package(
+            package_key, s3_store, "42", workflow_management_hook
+        )
+
+        assert failed_records == []
+        uploaded_key = s3_store.hook.load_string.call_args.args[1]
+        assert uploaded_key.endswith("/article_revision_.xml")
+        assert "#" not in uploaded_key
+        assert "?" not in uploaded_key
+        s3_store.hook.load_string.assert_called_once_with(
+            xml_text, uploaded_key, replace=True
+        )
+        workflow_data = workflow_management_hook.post_workflow.call_args.kwargs[
+            "workflow_data"
+        ]["data"]
+        assert "dois" not in workflow_data
+        document = workflow_data["documents"][0]
+        assert document["key"] == uploaded_key
+        assert urlparse(document["url"]).path == f"/elsevier-store/{uploaded_key}"
+
+    def test_process_article_without_doi_uses_deterministic_source_identity(
+        self, datadir
+    ):
+        file_name, xml_text = _read_article_without_doi(datadir)
+        identities = [
+            ("packages/issue-a.zip", file_name),
+            ("packages/issue-a.zip", "another-article.xml"),
+            ("packages/issue-a.zip", file_name),
+            ("packages/issue-b.zip", file_name),
+        ]
+        s3_store = Mock()
+        s3_store.key_to_s3_url.side_effect = (
+            lambda key: f"https://s3.example/elsevier-store/{key}"
+        )
+
+        for package_key, member_name in identities:
+            process_article(
+                file_name=member_name,
+                xml_text=xml_text,
+                submission_number="42",
+                s3_store=s3_store,
+                workflow_management_hook=Mock(),
+                source_key=package_key,
+            )
+
+        uploaded_keys = [
+            call.args[1] for call in s3_store.hook.load_string.call_args_list
+        ]
+        assert uploaded_keys[0] != uploaded_keys[1]
+        assert uploaded_keys[0] == uploaded_keys[2]
+        assert uploaded_keys[0] != uploaded_keys[3]
+
+    def test_process_article_without_doi_preserves_existing_key(self, datadir):
+        _, xml_text = _read_article_without_doi(datadir)
+        existing_key = "articles/10.1016/source.xml"
+        s3_store = Mock()
+        s3_store.key_to_s3_url.side_effect = (
+            lambda key: f"https://s3.example/elsevier-store/{key}"
+        )
+        workflow_management_hook = Mock()
+
+        failed_record = process_article(
+            file_name=existing_key,
+            xml_text=xml_text,
+            submission_number="42",
+            s3_store=s3_store,
+            workflow_management_hook=workflow_management_hook,
+            push_to_s3=False,
+        )
+
+        assert failed_record is None
+        s3_store.hook.load_string.assert_not_called()
+        workflow_data = workflow_management_hook.post_workflow.call_args.kwargs[
+            "workflow_data"
+        ]["data"]
+        assert workflow_data["documents"][0]["key"] == existing_key
+
+    @patch("include.utils.elsevier.ElsevierParser")
+    def test_process_article_reports_parser_errors(self, parser_class):
+        parser_class.side_effect = ValueError("invalid XML")
+
+        failed_record = process_article(
+            file_name="S0042207X26001600.xml",
+            xml_text="<article />",
+            submission_number="42",
+            s3_store=Mock(),
+            workflow_management_hook=Mock(),
+        )
+
+        assert failed_record == {
+            "doi": None,
+            "file": "S0042207X26001600.xml",
+            "error": "invalid XML",
+        }
+
+    @patch("include.utils.elsevier.ElsevierParser")
+    def test_process_article_reports_identifier_errors(self, parser_class):
+        parser_class.return_value.get_identifier.side_effect = ValueError("missing DOI")
+
+        failed_record = process_article(
+            file_name="S0042207X26001600.xml",
+            xml_text="<article />",
+            submission_number="42",
+            s3_store=Mock(),
+            workflow_management_hook=Mock(),
+        )
+
+        assert failed_record == {
+            "doi": None,
+            "file": "S0042207X26001600.xml",
+            "error": "missing DOI",
+        }
 
     @patch("hooks.generic_http_hook.GenericHttpHook.call_api")
     def test_fetch_package_feed(self, mock_call_api):

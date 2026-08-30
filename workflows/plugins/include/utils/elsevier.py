@@ -1,7 +1,11 @@
 import datetime
+import json
 import logging
+import re
 import zipfile
+from hashlib import sha256
 from io import BytesIO
+from posixpath import basename
 from xml.etree import ElementTree
 
 from include.utils.constants import HEP_PUBLISHER_CREATE
@@ -40,6 +44,7 @@ def process_package(package_key, s3_store, submission_number, workflow_managemen
                 submission_number,
                 s3_store,
                 workflow_management_hook,
+                source_key=package_key,
             )
             if failed_record:
                 failed_records.append(failed_record)
@@ -54,9 +59,11 @@ def process_article(
     s3_store,
     workflow_management_hook,
     push_to_s3=True,
+    source_key=None,
 ):
-    parser = ElsevierParser(xml_text)
+    doi = None
     try:
+        parser = ElsevierParser(xml_text)
         doi = parser.get_identifier()
         if not parser.should_record_be_harvested():
             logger.info(
@@ -65,7 +72,19 @@ def process_article(
             )
             return
 
-        file_key = f"articles/{doi}.xml"
+        if doi:
+            file_key = f"articles/{doi}.xml"
+        elif push_to_s3:
+            source_identifier = (
+                json.dumps([source_key, file_name], separators=(",", ":"))
+                if source_key is not None
+                else file_name
+            )
+            source_hash = sha256(source_identifier.encode("utf-8")).hexdigest()
+            article_file = re.sub(r"[^A-Za-z0-9._-]", "_", basename(file_name))
+            file_key = f"articles/{source_hash}/{article_file}"
+        else:
+            file_key = file_name
         if push_to_s3:
             s3_store.hook.load_string(xml_text, file_key, replace=True)
 
