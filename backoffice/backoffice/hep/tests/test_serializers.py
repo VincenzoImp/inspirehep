@@ -1,4 +1,10 @@
-from django.test import SimpleTestCase, TestCase
+import json
+import pytest
+
+from django.contrib.auth.models import Group
+from django.test import SimpleTestCase, TestCase, override_settings
+from django.urls import reverse
+from rest_framework.test import APIClient
 from unittest.mock import patch
 
 from backoffice.hep.api.serializers import (
@@ -6,6 +12,7 @@ from backoffice.hep.api.serializers import (
     HepWorkflowSerializer,
 )
 from backoffice.hep.constants import HepStatusChoices, HepWorkflowType
+from backoffice.users.tests.factories import UserFactory
 from django.apps import apps
 
 HepWorkflow = apps.get_model(app_label="hep", model_name="HepWorkflow")
@@ -84,25 +91,6 @@ class TestHepWorkflowSerializer(TestCase):
 
         self.assertEqual(workflow.form_data, payload["form_data"])
 
-    def test_serializer_deserializes_references_in_form_data(self):
-        workflow = HepWorkflow.objects.create(
-            workflow_type=HepWorkflowType.HEP_CREATE,
-            status=HepStatusChoices.RUNNING,
-            data={},
-            form_data={
-                "references": "[1] First line\\n[2] Second line\\n\\u03b1",
-                "url": "https://example.org",
-            },
-        )
-
-        serialized = HepWorkflowSerializer(workflow).data
-
-        self.assertEqual(
-            serialized["form_data"]["references"],
-            "[1] First line\n[2] Second line\nα",
-        )
-        self.assertEqual(serialized["form_data"]["url"], "https://example.org")
-
     def test_serializer_returns_null_form_data_when_missing(self):
         workflow = HepWorkflow.objects.create(
             workflow_type=HepWorkflowType.HEP_CREATE,
@@ -127,16 +115,13 @@ class TestHepWorkflowSerializer(TestCase):
 
         self.assertEqual(serialized["form_data"], {"url": "https://example.org"})
 
-    @patch("backoffice.hep.api.serializers.codecs.decode", side_effect=Exception)
-    def test_serializer_falls_back_to_original_references_on_decode_error(
-        self, mock_decode
-    ):
+    def test_serializer_preserves_non_string_references(self):
         workflow = HepWorkflow.objects.create(
             workflow_type=HepWorkflowType.HEP_CREATE,
             status=HepStatusChoices.RUNNING,
             data={},
             form_data={
-                "references": "[1] First line\\n[2] Second line",
+                "references": ["[1] First line", "[2] Second line"],
                 "url": "https://example.org",
             },
         )
@@ -145,8 +130,60 @@ class TestHepWorkflowSerializer(TestCase):
 
         self.assertEqual(
             serialized["form_data"]["references"],
-            "[1] First line\\n[2] Second line",
+            ["[1] First line", "[2] Second line"],
         )
-        mock_decode.assert_called_once_with(
-            "[1] First line\\n[2] Second line", "unicode_escape"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "references",
+    [
+        "[1] Müller, α decay\n[2] 李, 𝛽 decay",
+        r"[1] Study of $\alpha$, $\nu$ and $\times$",
+        r"[1] Literal \n and \u03b1 in a title",
+        "[1] Actual newline\n[2] Actual tab\tend",
+        "[1] Backslash before Greek \\α and Chinese \\李",
+        "[1] A\\\\B\n[2] Trailing backslash \\",
+        r"[1] Incomplete escapes \x and \u123",
+    ],
+)
+@override_settings(ALLOWED_HOSTS=["testserver"])
+def test_submission_references_survive_json_api_round_trips(references):
+    user = UserFactory()
+    group, _ = Group.objects.get_or_create(name="curator")
+    user.groups.add(group)
+    client = APIClient()
+    client.force_authenticate(user=user)
+    payload = {
+        "workflow_type": HepWorkflowType.HEP_SUBMISSION,
+        "status": HepStatusChoices.RUNNING,
+        "data": {
+            "_collections": ["Literature"],
+            "document_type": ["article"],
+            "titles": [{"title": "Reference preservation"}],
+        },
+        "form_data": {"references": references, "url": "https://example.org"},
+    }
+
+    # Exercise real JSON parsing: wire escapes are decoded once by the parser.
+    with patch("backoffice.hep.api.views.trigger_hep_workflow_initialization.delay"):
+        created = client.post(
+            reverse("api:hep-list"),
+            json.dumps(payload, ensure_ascii=True),
+            content_type="application/json",
         )
+    assert created.status_code == 201, created.data
+    workflow = HepWorkflow.objects.get(pk=created.json()["id"])
+    assert workflow.form_data == payload["form_data"]
+    assert created.json()["form_data"] == payload["form_data"]
+
+    url = reverse("api:hep-detail", kwargs={"pk": workflow.pk})
+    for _ in range(2):
+        retrieved = client.get(url)
+        assert retrieved.status_code == 200
+        assert retrieved.json()["form_data"] == payload["form_data"]
+        updated = client.put(url, retrieved.json(), format="json")
+        assert updated.status_code == 200, updated.data
+        workflow.refresh_from_db()
+        assert workflow.form_data == payload["form_data"]
+        assert updated.json()["form_data"] == payload["form_data"]
