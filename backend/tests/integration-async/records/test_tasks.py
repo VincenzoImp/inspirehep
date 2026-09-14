@@ -13,7 +13,114 @@ from inspire_utils.record import get_value
 from inspirehep.records.api.base import InspireRecord
 from inspirehep.search.api import InspireSearch, LiteratureSearch
 from invenio_db import db
+from invenio_records.models import RecordMetadata
 from tenacity import stop_after_delay, wait_fixed
+
+
+@pytest.fixture
+def redirect_references_mock(inspire_app, mocker):
+    mocker.patch("inspirehep.records.api.base.InspireRecord.index")
+    return mocker.patch(
+        "inspirehep.records.receivers.redirect_references_to_merged_record.delay"
+    )
+
+
+def test_redirect_references_waits_for_commit(inspire_app, redirect_references_mock):
+    experiment = InspireRecord.create(faker.record("exp", with_control_number=True))
+    db.session.commit()
+
+    merged_data = faker.record("exp", with_control_number=True)
+    merged_data["deleted_records"] = [experiment["self"]]
+    merged = InspireRecord.create(merged_data)
+    redirect_references_mock.assert_not_called()
+
+    def assert_committed(record_uuid):
+        with db.engine.connect() as connection:
+            record = connection.execute(
+                RecordMetadata.__table__.select().where(
+                    RecordMetadata.id == record_uuid
+                )
+            ).one()
+        assert record.json["new_record"] == merged["self"]
+
+    redirect_references_mock.side_effect = assert_committed
+    db.session.commit()
+    redirect_references_mock.assert_called_once_with(str(experiment.id))
+
+
+@pytest.mark.parametrize("finish_transaction", ["rollback", "close"])
+def test_redirect_references_discards_rolled_back_merge(
+    inspire_app, redirect_references_mock, finish_transaction
+):
+    experiment = InspireRecord.create(faker.record("exp", with_control_number=True))
+    db.session.commit()
+
+    merged_data = faker.record("exp", with_control_number=True)
+    merged_data["deleted_records"] = [experiment["self"]]
+    InspireRecord.create(merged_data)
+    getattr(db.session, finish_transaction)()
+
+    # Reusing the session must not dispatch work from the aborted transaction.
+    db.session.commit()
+    redirect_references_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("commit_savepoint", [False, True])
+def test_redirect_references_preserves_parent_merge(
+    inspire_app, redirect_references_mock, commit_savepoint
+):
+    experiments = [
+        InspireRecord.create(faker.record("exp", with_control_number=True))
+        for _ in range(2)
+    ]
+    db.session.commit()
+
+    merged_data = faker.record("exp", with_control_number=True)
+    merged_data["deleted_records"] = [experiments[0]["self"]]
+    InspireRecord.create(merged_data)
+
+    with db.session.begin_nested() as savepoint:
+        merged_data = faker.record("exp", with_control_number=True)
+        merged_data["deleted_records"] = [experiments[1]["self"]]
+        InspireRecord.create(merged_data)
+        if not commit_savepoint:
+            savepoint.rollback()
+
+    redirect_references_mock.assert_not_called()
+    db.session.commit()
+
+    expected_calls = [mock.call(str(experiments[0].id))]
+    if commit_savepoint:
+        expected_calls.append(mock.call(str(experiments[1].id)))
+    redirect_references_mock.assert_has_calls(expected_calls, any_order=True)
+    assert redirect_references_mock.call_count == len(expected_calls)
+
+
+def test_redirect_references_dispatches_each_source_once(
+    inspire_app, redirect_references_mock
+):
+    experiments = [
+        InspireRecord.create(faker.record("exp", with_control_number=True))
+        for _ in range(2)
+    ]
+    db.session.commit()
+
+    merged_data = faker.record("exp", with_control_number=True)
+    merged_data["deleted_records"] = [record["self"] for record in experiments]
+    InspireRecord.create(merged_data)
+    source = InspireRecord.get_record(experiments[0].id, with_deleted=True)
+    source.update(dict(source))
+    redirect_references_mock.assert_not_called()
+
+    db.session.commit()
+    redirect_references_mock.assert_has_calls(
+        [mock.call(str(record.id)) for record in experiments], any_order=True
+    )
+    assert redirect_references_mock.call_count == 2
+
+    redirect_references_mock.reset_mock()
+    db.session.commit()
+    redirect_references_mock.assert_not_called()
 
 
 @pytest.mark.skip(reason="Flaky test")
